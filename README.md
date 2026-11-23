@@ -1,12 +1,14 @@
 # WatchDocs
 
-**Read PDF, Word and Excel documents on your Wear OS watch. Free, no ads, no subscription.**
+**Read PDFs, Word and Excel documents and view images on your Wear OS watch. Free, no ads, no subscription.**
 
 Send a document from your phone, and it's stored on the watch, so you can read it offline.
 
 - **PDF:** drag to move, pinch or double-tap to zoom (sharp text up to 6×), turn the crown to scroll, tap for page controls and go-to-page. It remembers where you left off.
 - **Word (.docx):** text, headings, lists and tables, with adjustable text size.
 - **Excel (.xlsx):** a scrollable grid with all sheets.
+- **Images (JPG, PNG, WebP, HEIC…):** pan and zoom. The phone shrinks big photos before sending, so transfers are fast.
+- **Crown:** scrolls by default. Switch it to zoom in the watch app's Settings, or with the "Crown" button in the viewer controls.
 
 Works with Wear OS 3+ watches (Pixel Watch, Galaxy Watch 4 and newer, …) paired with an Android phone.
 
