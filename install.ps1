@@ -44,7 +44,29 @@ function Get-Apk($name) {
     return $path
 }
 
+function Find-PairedDevice($kind) {
+    # Devices paired before (with Wireless debugging on) announce themselves on the network.
+    foreach ($line in ((Invoke-Adb mdns services) -split "`n")) {
+        if ($line -match '_adb-tls-connect\._tcp\.?\s+(\d+\.\d+\.\d+\.\d+:\d+)') { Invoke-Adb connect $Matches[1] | Out-Null }
+    }
+    foreach ($line in ((Invoke-Adb devices) -split "`n")) {
+        if ($line -match '^(\d+\.\d+\.\d+\.\d+:\d+)\s+device$') {
+            $conn = $Matches[1]
+            $isWatch = (Invoke-Adb -s $conn shell getprop ro.build.characteristics) -match 'watch'
+            if (($kind -eq 'watch') -eq $isWatch) {
+                $model = Invoke-Adb -s $conn shell getprop ro.product.model
+                $yes = Read-Host "Found $model. Install on it? (Y/n)"
+                if ($yes -notmatch '^[nN]') { return $conn }
+            }
+        }
+    }
+    return $null
+}
+
 function Connect-Device($kind) {
+    $known = Find-PairedDevice $kind
+    if ($known) { return $known }
+
     Write-Step "Connect your $kind"
     if ($kind -eq 'watch') {
         Write-Host '1. On the watch: Settings > System > About > Versions > tap "Build number" 7 times.'
