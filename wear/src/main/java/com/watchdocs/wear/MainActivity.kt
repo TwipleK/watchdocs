@@ -52,7 +52,9 @@ import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.PositionIndicator
 import androidx.wear.compose.material.Scaffold
 import androidx.wear.compose.material.Text
+import androidx.wear.compose.material.Switch
 import androidx.wear.compose.material.TimeText
+import androidx.wear.compose.material.ToggleChip
 import androidx.wear.compose.navigation.SwipeDismissableNavHost
 import androidx.wear.compose.navigation.composable
 import androidx.wear.compose.navigation.rememberSwipeDismissableNavController
@@ -61,6 +63,7 @@ import java.io.File
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Settings.init(this)
         DocStore.refresh(this)
         setContent { App() }
     }
@@ -122,7 +125,7 @@ fun DocListScreen(onOpen: (String) -> Unit, onDelete: (String) -> Unit) {
             if (docs.isEmpty()) {
                 item {
                     Text(
-                        "No documents yet.\n\nOpen WatchDocs on your phone and send a PDF, Word or Excel file.",
+                        "No documents yet.\n\nOpen WatchDocs on your phone and send a PDF, Word, Excel file or image.",
                         textAlign = TextAlign.Center,
                         style = MaterialTheme.typography.body2,
                         modifier = Modifier.padding(horizontal = 12.dp),
@@ -141,6 +144,17 @@ fun DocListScreen(onOpen: (String) -> Unit, onDelete: (String) -> Unit) {
                         textAlign = TextAlign.Center,
                     )
                 }
+            }
+            item { ListHeader { Text("Settings") } }
+            item {
+                ToggleChip(
+                    checked = Settings.crownZooms,
+                    onCheckedChange = { Settings.updateCrownZooms(it) },
+                    label = { Text("Crown zooms") },
+                    secondaryLabel = { Text(if (Settings.crownZooms) "Crown zooms PDFs & images" else "Crown scrolls") },
+                    toggleControl = { Switch(checked = Settings.crownZooms) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
         }
     }

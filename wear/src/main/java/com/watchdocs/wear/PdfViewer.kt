@@ -2,8 +2,12 @@ package com.watchdocs.wear
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas as AndroidCanvas
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.pdf.PdfRenderer
+import android.media.ExifInterface
 import android.os.ParcelFileDescriptor
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
@@ -80,59 +84,120 @@ import androidx.wear.compose.material.Text
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import java.io.Closeable
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 private const val MIN_SCALE = 1f
 private const val MAX_SCALE = 6f
 
-// ---------------------------------------------------------------- PDF document
+/** Sharp tiles are rendered at one of these zoom levels (the next one up from the current zoom). */
+private val TILE_LEVELS = floatArrayOf(1.5f, 2f, 3f, 4f, 6f)
+private const val TILE_PX = 256
+private const val MAX_TILES = 90
+private const val MAX_IMAGE_DIM = 2048
 
-class PdfDoc(file: File) : Closeable {
+// ---------------------------------------------------------------- page sources
+
+/** Something with pages that can be rendered: a PDF, or a single image. */
+interface PageSource : Closeable {
+    val pageCount: Int
+    val isImage: Boolean get() = false
+
+    /** [width, height] in source units (PDF points / image pixels). May be refined by [loadExactSizes]. */
+    fun pageSize(i: Int): IntArray
+
+    /** Measures every page; returns true if any size differs from the initial estimate. */
+    suspend fun loadExactSizes(): Boolean = false
+
+    /** Renders a page into a w×h bitmap. A null matrix fits the whole page into the bitmap. */
+    suspend fun render(index: Int, w: Int, h: Int, matrix: Matrix?): ImageBitmap?
+}
+
+class PdfDoc(file: File) : PageSource {
     private val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
     private val renderer = try {
         PdfRenderer(pfd)
     } catch (e: Exception) {
         pfd.close(); throw e
     }
-    val pageCount = renderer.pageCount
+    override val pageCount = renderer.pageCount
 
-    /** [width, height] in PDF points for every page. */
-    val sizes: List<IntArray> = List(pageCount) { i ->
-        renderer.openPage(i).use { intArrayOf(it.width.coerceAtLeast(1), it.height.coerceAtLeast(1)) }
-    }
+    // Only page 1 is measured up front (opening every page is slow for long PDFs);
+    // the rest are assumed to be the same size until loadExactSizes() runs.
+    private val sizes: Array<IntArray>
 
-    // PdfRenderer allows only one open page at a time.
+    // PdfRenderer allows only one open page at a time; keep the last one open since
+    // consecutive tiles usually come from the same page.
     private val mutex = Mutex()
     private var closed = false
+    private var openPage: PdfRenderer.Page? = null
 
-    /** Renders a page into a w×h bitmap. A null matrix fits the whole page into the bitmap. */
-    suspend fun render(index: Int, w: Int, h: Int, matrix: Matrix?): ImageBitmap? = withContext(Dispatchers.IO) {
-        mutex.withLock {
-            if (closed) return@withLock null
-            renderer.openPage(index).use { page ->
+    init {
+        val first = if (pageCount > 0) renderer.openPage(0).use { measure(it) } else intArrayOf(1, 1)
+        sizes = Array(pageCount) { first }
+    }
+
+    private fun measure(p: PdfRenderer.Page) = intArrayOf(p.width.coerceAtLeast(1), p.height.coerceAtLeast(1))
+
+    private fun page(i: Int): PdfRenderer.Page {
+        openPage?.let { if (it.index == i) return it }
+        openPage?.close()
+        return renderer.openPage(i).also { openPage = it }
+    }
+
+    override fun pageSize(i: Int) = sizes[i]
+
+    override suspend fun loadExactSizes(): Boolean = withContext(Dispatchers.IO) {
+        var changed = false
+        var i = 1
+        while (i < pageCount) {
+            mutex.withLock {
+                if (closed) return@withContext changed
+                val end = min(i + 16, pageCount)
+                while (i < end) {
+                    val s = measure(page(i))
+                    if (!s.contentEquals(sizes[i])) {
+                        sizes[i] = s
+                        changed = true
+                    }
+                    i++
+                }
+            }
+            yield() // let pending renders in between
+        }
+        changed
+    }
+
+    override suspend fun render(index: Int, w: Int, h: Int, matrix: Matrix?): ImageBitmap? =
+        withContext(Dispatchers.IO) {
+            mutex.withLock {
+                if (closed) return@withLock null
                 val bmp = Bitmap.createBitmap(w.coerceAtLeast(1), h.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
                 bmp.eraseColor(android.graphics.Color.WHITE)
-                page.render(bmp, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                page(index).render(bmp, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                 bmp.asImageBitmap()
             }
         }
-    }
 
     override fun close() {
         CoroutineScope(Dispatchers.IO).launch {
             mutex.withLock {
                 closed = true
+                openPage?.close()
+                openPage = null
                 renderer.close()
                 pfd.close()
             }
@@ -140,18 +205,61 @@ class PdfDoc(file: File) : Closeable {
     }
 }
 
+class ImageDoc(file: File) : PageSource {
+    private val bitmap: Bitmap
+
+    init {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) error("Not an image")
+        var sample = 1
+        while (max(bounds.outWidth, bounds.outHeight) / sample > MAX_IMAGE_DIM) sample *= 2
+        val decoded = BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })
+            ?: error("Couldn't decode image")
+        val rotation = runCatching {
+            when (ExifInterface(file.path).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                else -> 0f
+            }
+        }.getOrDefault(0f)
+        bitmap = if (rotation == 0f) decoded else
+            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, Matrix().apply { postRotate(rotation) }, true)
+    }
+
+    private val size = intArrayOf(bitmap.width, bitmap.height)
+    private val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+
+    override val pageCount = 1
+    override val isImage = true
+    override fun pageSize(i: Int) = size
+
+    override suspend fun render(index: Int, w: Int, h: Int, matrix: Matrix?): ImageBitmap =
+        withContext(Dispatchers.Default) {
+            val out = Bitmap.createBitmap(w.coerceAtLeast(1), h.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+            out.eraseColor(android.graphics.Color.BLACK)
+            val m = matrix ?: Matrix().apply { setScale(w.toFloat() / bitmap.width, h.toFloat() / bitmap.height) }
+            AndroidCanvas(out).drawBitmap(bitmap, m, paint)
+            out.asImageBitmap()
+        }
+
+    override fun close() {}
+}
+
 // ---------------------------------------------------------------- geometry & view state
 
 /** Pages stacked vertically in "document pixels" (fit-to-width size, scale 1). */
-private class PdfLayout(sizes: List<IntArray>, val fitW: Float, gap: Float) {
-    val heights = FloatArray(sizes.size) { fitW * sizes[it][1] / sizes[it][0] }
-    val tops = FloatArray(sizes.size)
+private class PdfLayout(doc: PageSource, val fitW: Float, gap: Float) {
+    val count = doc.pageCount
+    val heights = FloatArray(count) { doc.pageSize(it).let { s -> fitW * s[1] / s[0] } }
+    val pointsToDoc = FloatArray(count) { fitW / doc.pageSize(it)[0] }
+    val tops = FloatArray(count)
     val docH: Float
-    val pointsToDoc = FloatArray(sizes.size) { fitW / sizes[it][0] }
 
     init {
         var y = 0f
-        for (i in heights.indices) {
+        for (i in 0 until count) {
             tops[i] = y
             y += heights[i] + gap
         }
@@ -160,7 +268,7 @@ private class PdfLayout(sizes: List<IntArray>, val fitW: Float, gap: Float) {
 
     fun pageAt(y: Float): Int {
         var lo = 0
-        var hi = tops.size - 1
+        var hi = count - 1
         while (lo < hi) {
             val mid = (lo + hi + 1) / 2
             if (tops[mid] <= y) lo = mid else hi = mid - 1
@@ -171,7 +279,7 @@ private class PdfLayout(sizes: List<IntArray>, val fitW: Float, gap: Float) {
     fun visible(top: Float, bottom: Float): IntRange {
         val a = pageAt(top)
         var b = a
-        while (b + 1 < tops.size && tops[b + 1] < bottom) b++
+        while (b + 1 < count && tops[b + 1] < bottom) b++
         return a..b
     }
 }
@@ -182,22 +290,24 @@ private class PdfLayout(sizes: List<IntArray>, val fitW: Float, gap: Float) {
  */
 @Stable
 private class PdfViewState(
-    val layout: PdfLayout,
+    initialLayout: PdfLayout,
     val screenW: Float,
     val screenH: Float,
+    centered: Boolean,
     private val scope: CoroutineScope,
 ) {
+    var layout by mutableStateOf(initialLayout); private set
     var scale by mutableFloatStateOf(1f); private set
     var vx by mutableFloatStateOf(0f); private set
     var vy by mutableFloatStateOf(0f); private set
 
-    private val sideMargin = (screenW - layout.fitW) / 2f
-    private val topPad = screenH * 0.14f
-    private val bottomPad = screenH * 0.25f
+    private val topPad = if (centered) 0f else screenH * 0.14f
+    private val bottomPad = if (centered) 0f else screenH * 0.25f
     private var anim: Job? = null
 
     val isFit get() = scale < 1.02f
     val center get() = Offset(screenW / 2f, screenH / 2f)
+    private val sideMargin get() = (screenW - layout.fitW) / 2f
 
     /** Page under the middle of the screen (for the page counter). */
     val currentPage get() = layout.pageAt(vy + screenH / scale / 2f)
@@ -208,6 +318,7 @@ private class PdfViewState(
     init {
         vx = -sideMargin
         vy = -topPad
+        clamp()
     }
 
     private fun clamp() {
@@ -216,7 +327,14 @@ private class PdfViewState(
         vx = if (maxX <= minX) (minX + maxX) / 2f else vx.coerceIn(minX, maxX)
         val minY = -topPad / scale
         val maxY = layout.docH + bottomPad / scale - screenH / scale
-        vy = if (maxY <= minY) minY else vy.coerceIn(minY, maxY)
+        vy = if (maxY <= minY) (minY + maxY) / 2f else vy.coerceIn(minY, maxY)
+    }
+
+    /** Swap in a re-measured layout, keeping the same spot in the document on screen. */
+    fun replaceLayout(newLayout: PdfLayout) {
+        val (p, f, s) = position()
+        layout = newLayout
+        restore(p, f, s)
     }
 
     fun stop() {
@@ -264,7 +382,7 @@ private class PdfViewState(
 
     fun goToPage(i: Int) {
         stop()
-        val page = i.coerceIn(0, layout.tops.size - 1)
+        val page = i.coerceIn(0, layout.count - 1)
         val target = layout.tops[page] - topPad / scale
         anim = scope.launch {
             animate(vy, target, animationSpec = tween(320)) { value, _ ->
@@ -287,6 +405,12 @@ private class PdfViewState(
         panBy(Offset(0f, -px))
     }
 
+    /** Crown in zoom mode: turning it "down" zooms in around the centre. */
+    fun crownZoom(px: Float) {
+        stop()
+        zoomAround(scale * kotlin.math.exp(px * 0.004f), center)
+    }
+
     fun position(): Triple<Int, Float, Float> {
         val y = vy + topPad / scale
         val p = layout.pageAt(y)
@@ -294,7 +418,7 @@ private class PdfViewState(
     }
 
     fun restore(page: Int, frac: Float, s: Float) {
-        val p = page.coerceIn(0, layout.tops.size - 1)
+        val p = page.coerceIn(0, layout.count - 1)
         scale = s.coerceIn(MIN_SCALE, MAX_SCALE)
         vx = layout.fitW / 2f - screenW / scale / 2f
         vy = layout.tops[p] + frac * layout.heights[p] - topPad / scale
@@ -302,9 +426,43 @@ private class PdfViewState(
     }
 }
 
-private class Tile(val page: Int, val x: Float, val y: Float, val w: Float, val h: Float, val image: ImageBitmap)
+private data class TileKey(val page: Int, val level: Float, val tx: Int, val ty: Int)
 
-/** Remembers where you were in each PDF. */
+/** A sharp piece of a page; x/y/w/h are document coordinates. */
+private class Tile(val key: TileKey, val x: Float, val y: Float, val w: Float, val h: Float, val image: ImageBitmap)
+
+private fun levelFor(scale: Float): Float? =
+    if (scale < 1.08f) null else TILE_LEVELS.firstOrNull { it >= scale * 0.92f } ?: TILE_LEVELS.last()
+
+/** Tiles covering the viewport (plus [margin] extra tiles around it), nearest to the centre first. */
+private fun tilesFor(
+    layout: PdfLayout, vx: Float, vy: Float, visW: Float, visH: Float, level: Float, margin: Int,
+): List<TileKey> {
+    val d = TILE_PX / level
+    val left = vx - margin * d
+    val right = vx + visW + margin * d
+    val top = vy - margin * d
+    val bottom = vy + visH + margin * d
+    val cx = vx + visW / 2f
+    val cy = vy + visH / 2f
+    val out = ArrayList<Pair<TileKey, Float>>()
+    for (p in layout.visible(top, bottom)) {
+        val pageTop = layout.tops[p]
+        val pageBottom = pageTop + layout.heights[p]
+        val x0 = floor(max(left, 0f) / d).toInt()
+        val x1 = floor((min(right, layout.fitW) - 0.01f) / d).toInt()
+        val y0 = floor((max(top, pageTop) - pageTop) / d).toInt()
+        val y1 = floor((min(bottom, pageBottom) - pageTop - 0.01f) / d).toInt()
+        for (ty in y0..y1) for (tx in x0..x1) {
+            val dx = (tx + 0.5f) * d - cx
+            val dy = pageTop + (ty + 0.5f) * d - cy
+            out += TileKey(p, level, tx, ty) to (dx * dx + dy * dy)
+        }
+    }
+    return out.sortedBy { it.second }.map { it.first }
+}
+
+/** Remembers where you were in each document. */
 private object PdfPositions {
     private fun prefs(ctx: Context) = ctx.getSharedPreferences("pdf_positions", Context.MODE_PRIVATE)
 
@@ -327,8 +485,21 @@ private object PdfPositions {
 
 @Composable
 fun PdfViewer(file: File) {
-    val result by produceState<Result<PdfDoc>?>(null, file) {
-        val r = withContext(Dispatchers.IO) { runCatching { PdfDoc(file) } }
+    PagedViewer(file, open = { PdfDoc(it) }) {
+        if (it is SecurityException) "This PDF is password-protected and can't be opened."
+        else "Couldn't open this PDF."
+    }
+}
+
+@Composable
+fun ImageViewer(file: File) {
+    PagedViewer(file, open = { ImageDoc(it) }) { "Couldn't open this image." }
+}
+
+@Composable
+private fun PagedViewer(file: File, open: (File) -> PageSource, errorText: (Throwable) -> String) {
+    val result by produceState<Result<PageSource>?>(null, file) {
+        val r = withContext(Dispatchers.IO) { runCatching { open(file) } }
         value = r
         awaitDispose { r.getOrNull()?.close() }
     }
@@ -336,21 +507,16 @@ fun PdfViewer(file: File) {
         null -> Loading()
         else -> r.fold(
             onSuccess = {
-                if (it.pageCount == 0) ErrorMessage("This PDF has no pages")
-                else PdfScreen(it, "${file.name}:${file.length()}")
+                if (it.pageCount == 0) ErrorMessage("This document has no pages")
+                else PagedScreen(it, "${file.name}:${file.length()}")
             },
-            onFailure = {
-                ErrorMessage(
-                    if (it is SecurityException) "This PDF is password-protected and can't be opened."
-                    else "Couldn't open this PDF."
-                )
-            },
+            onFailure = { ErrorMessage(errorText(it)) },
         )
     }
 }
 
 @Composable
-private fun PdfScreen(doc: PdfDoc, positionKey: String) {
+private fun PagedScreen(doc: PageSource, positionKey: String) {
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
         val density = LocalDensity.current
         val ctx = LocalContext.current
@@ -358,8 +524,23 @@ private fun PdfScreen(doc: PdfDoc, positionKey: String) {
         val sw = constraints.maxWidth.toFloat()
         val sh = constraints.maxHeight.toFloat()
         val scope = rememberCoroutineScope()
-        val layout = remember(doc, sw) { PdfLayout(doc.sizes, sw * 0.88f, with(density) { 8.dp.toPx() }) }
-        val state = remember(layout, sh) { PdfViewState(layout, sw, sh, scope) }
+        val gap = with(density) { 8.dp.toPx() }
+        val fitW = remember(doc, sw, sh) {
+            if (doc.isImage) {
+                // Whole image visible: fit inside the screen, not just to its width.
+                val s = doc.pageSize(0)
+                min(sw * 0.92f, sh * 0.92f * s[0] / s[1])
+            } else {
+                sw * 0.88f
+            }
+        }
+        val state = remember(doc, sw, sh) {
+            PdfViewState(PdfLayout(doc, fitW, gap), sw, sh, centered = doc.isImage, scope)
+        }
+        val pageBackground = if (doc.isImage) Color.Black else Color.White
+
+        val base = remember(doc) { mutableStateMapOf<Int, ImageBitmap>() }      // whole pages, sharp at 1×
+        val tiles = remember(doc) { mutableStateMapOf<TileKey, Tile>() }        // sharp pieces when zoomed
 
         // Remember position per document.
         LaunchedEffect(state) {
@@ -369,55 +550,68 @@ private fun PdfScreen(doc: PdfDoc, positionKey: String) {
             onDispose { PdfPositions.save(ctx, positionKey, state.position()) }
         }
 
-        // Low-res page bitmaps (exactly sharp at fit-to-width), kept for nearby pages only.
-        val base = remember(doc) { mutableStateMapOf<Int, ImageBitmap>() }
+        // Measure the remaining pages in the background; re-layout only if sizes differ.
         LaunchedEffect(state) {
-            snapshotFlow { layout.visible(state.vy, state.vy + sh / state.scale) }
-                .distinctUntilChanged()
-                .collectLatest { vis ->
-                    val first = (vis.first - 1).coerceAtLeast(0)
-                    val last = (vis.last + 1).coerceAtMost(doc.pageCount - 1)
-                    base.keys.filter { it < first - 3 || it > last + 3 }.forEach { base.remove(it) }
-                    for (i in vis.toList() + listOf(vis.last + 1, vis.first - 1)) {
-                        if (i !in first..last || base[i] != null) continue
-                        doc.render(i, layout.fitW.roundToInt(), layout.heights[i].roundToInt(), null)
-                            ?.let { base[i] = it }
-                    }
-                }
+            if (doc.loadExactSizes()) {
+                state.replaceLayout(PdfLayout(doc, fitW, gap))
+                base.clear()
+                tiles.clear()
+            }
         }
 
-        // High-res tiles of exactly what's on screen, re-rendered once you stop moving.
-        var tiles by remember(doc) { mutableStateOf<List<Tile>>(emptyList()) }
+        // One render worker (PdfRenderer is single-threaded) that always does the most useful job next:
+        // visible pages → visible sharp tiles → neighbouring pages → tiles just off-screen.
         LaunchedEffect(state) {
-            snapshotFlow { Triple(state.scale, state.vx, state.vy) }.collectLatest { (s, vx, vy) ->
-                delay(120)
-                if (s < 1.05f) {
-                    tiles = emptyList()
-                    return@collectLatest
-                }
+            val wake = Channel<Unit>(Channel.CONFLATED)
+            launch {
+                snapshotFlow { arrayOf<Any>(state.scale, state.vx, state.vy, state.layout) }
+                    .collect { wake.trySend(Unit) }
+            }
+            while (true) {
+                val layout = state.layout
+                val s = state.scale
+                val vx = state.vx
+                val vy = state.vy
                 val visW = sw / s
                 val visH = sh / s
-                val out = mutableListOf<Tile>()
-                for (i in layout.visible(vy, vy + visH)) {
-                    val l = maxOf(vx, 0f)
-                    val r = minOf(vx + visW, layout.fitW)
-                    val t = maxOf(vy, layout.tops[i])
-                    val b = minOf(vy + visH, layout.tops[i] + layout.heights[i])
-                    if (r <= l || b <= t) continue
-                    val k = layout.pointsToDoc[i] * s
-                    val m = Matrix().apply {
-                        setScale(k, k)
-                        postTranslate(-l * s, (layout.tops[i] - t) * s)
+                val vis = layout.visible(vy, vy + visH)
+                val level = levelFor(s)
+
+                val visibleBase = vis.firstOrNull { base[it] == null }
+                val visibleTile = level?.let { l -> tilesFor(layout, vx, vy, visW, visH, l, 0).firstOrNull { it !in tiles } }
+                val nearBase = if (visibleBase == null && visibleTile == null) {
+                    listOf(vis.last + 1, vis.first - 1, vis.last + 2).firstOrNull { it in 0 until layout.count && base[it] == null }
+                } else null
+                val nearTile = if (visibleBase == null && visibleTile == null && nearBase == null) {
+                    level?.let { l -> tilesFor(layout, vx, vy, visW, visH, l, 1).firstOrNull { it !in tiles } }
+                } else null
+
+                val pageJob = visibleBase ?: nearBase
+                val tileJob = if (visibleBase != null) null else visibleTile ?: nearTile
+                when {
+                    pageJob != null && (visibleBase != null || tileJob == null) -> {
+                        val img = doc.render(pageJob, layout.fitW.roundToInt(), layout.heights[pageJob].roundToInt(), null)
+                            ?: break
+                        if (state.layout === layout) {
+                            base[pageJob] = img
+                            val c = state.currentPage
+                            base.keys.filter { abs(it - c) > 4 }.forEach { base.remove(it) }
+                        }
                     }
-                    val w = ceil((r - l) * s).toInt()
-                    val h = ceil((b - t) * s).toInt()
-                    doc.render(i, w, h, m)?.let { out += Tile(i, l, t, r - l, b - t, it) }
+                    tileJob != null -> {
+                        val tile = renderTile(doc, layout, tileJob) ?: break
+                        if (state.layout === layout) {
+                            tiles[tileJob] = tile
+                            if (tiles.size > MAX_TILES) evictFarTiles(tiles, state.vx + visW / 2f, state.vy + visH / 2f)
+                        }
+                    }
+                    else -> wake.receive() // everything useful is rendered; wait for the view to change
                 }
-                tiles = out
             }
         }
 
         // Controls overlay.
+        val multiPage = doc.pageCount > 1
         var hudVisible by remember { mutableStateOf(true) }
         var hudTick by remember { mutableIntStateOf(0) }
         var pickerOpen by remember { mutableStateOf(false) }
@@ -444,7 +638,8 @@ private fun PdfScreen(doc: PdfDoc, positionKey: String) {
             Modifier
                 .fillMaxSize()
                 .onRotaryScrollEvent {
-                    state.crown(it.verticalScrollPixels)
+                    if (Settings.crownZooms) state.crownZoom(it.verticalScrollPixels)
+                    else state.crown(it.verticalScrollPixels)
                     true
                 }
                 .focusRequester(canvasFocus)
@@ -501,37 +696,37 @@ private fun PdfScreen(doc: PdfDoc, positionKey: String) {
                     }
                 },
         ) {
+            val layout = state.layout
             val s = state.scale
             val vx = state.vx
             val vy = state.vy
-            for (i in layout.visible(vy, vy + size.height / s)) {
-                val x = -vx * s
-                val y = (layout.tops[i] - vy) * s
-                val w = layout.fitW * s
-                val h = layout.heights[i] * s
-                drawRect(Color.White, Offset(x, y), Size(w, h))
-                base[i]?.let { img ->
-                    drawImage(
-                        img,
-                        dstOffset = IntOffset(x.roundToInt(), y.roundToInt()),
-                        dstSize = IntSize(w.roundToInt(), h.roundToInt()),
-                        filterQuality = FilterQuality.Medium,
-                    )
-                }
+            val visH = size.height / s
+            val visW = size.width / s
+
+            fun drawPiece(img: ImageBitmap, x: Float, y: Float, w: Float, h: Float) {
+                // Round each edge separately so neighbouring tiles meet without gaps.
+                val l = ((x - vx) * s).roundToInt()
+                val t = ((y - vy) * s).roundToInt()
+                val r = ((x + w - vx) * s).roundToInt()
+                val b = ((y + h - vy) * s).roundToInt()
+                drawImage(img, dstOffset = IntOffset(l, t), dstSize = IntSize(r - l, b - t), filterQuality = FilterQuality.Medium)
             }
-            for (t in tiles) {
-                drawImage(
-                    t.image,
-                    dstOffset = IntOffset(((t.x - vx) * s).roundToInt(), ((t.y - vy) * s).roundToInt()),
-                    dstSize = IntSize((t.w * s).roundToInt(), (t.h * s).roundToInt()),
-                    filterQuality = FilterQuality.Medium,
-                )
+
+            for (i in layout.visible(vy, vy + visH)) {
+                drawRect(pageBackground, Offset(-vx * s, (layout.tops[i] - vy) * s), Size(layout.fitW * s, layout.heights[i] * s))
+                base[i]?.let { drawPiece(it, 0f, layout.tops[i], layout.fitW, layout.heights[i]) }
             }
+            // Tiles from other zoom levels first (as a better-than-nothing fallback), current level on top.
+            val level = levelFor(s)
+            tiles.values
+                .filter { it.x < vx + visW && it.x + it.w > vx && it.y < vy + visH && it.y + it.h > vy }
+                .sortedBy { if (it.key.level == level) Float.MAX_VALUE else it.key.level }
+                .forEach { drawPiece(it.image, it.x, it.y, it.w, it.h) }
         }
 
         // Small page counter while scrolling with the controls hidden.
         AnimatedVisibility(
-            visible = pillVisible && !hudVisible && !pickerOpen,
+            visible = multiPage && pillVisible && !hudVisible && !pickerOpen,
             enter = fadeIn(), exit = fadeOut(),
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp),
         ) {
@@ -544,16 +739,22 @@ private fun PdfScreen(doc: PdfDoc, positionKey: String) {
             modifier = Modifier.fillMaxSize(),
         ) {
             Box(Modifier.fillMaxSize()) {
+                if (multiPage) {
+                    Pill(
+                        "Page ${page + 1} / ${doc.pageCount}  ▾",
+                        Modifier.align(Alignment.TopCenter).padding(top = 16.dp),
+                    ) { pickerOpen = true }
+                    RoundButton("‹", Modifier.align(Alignment.CenterStart).padding(start = 6.dp)) {
+                        state.prevPage(); poke()
+                    }
+                    RoundButton("›", Modifier.align(Alignment.CenterEnd).padding(end = 6.dp)) {
+                        state.nextPage(); poke()
+                    }
+                }
                 Pill(
-                    "Page ${page + 1} / ${doc.pageCount}  ▾",
-                    Modifier.align(Alignment.TopCenter).padding(top = 16.dp),
-                ) { pickerOpen = true }
-                RoundButton("‹", Modifier.align(Alignment.CenterStart).padding(start = 6.dp)) {
-                    state.prevPage(); poke()
-                }
-                RoundButton("›", Modifier.align(Alignment.CenterEnd).padding(end = 6.dp)) {
-                    state.nextPage(); poke()
-                }
+                    if (Settings.crownZooms) "Crown: zoom" else "Crown: scroll",
+                    Modifier.align(Alignment.BottomCenter).padding(bottom = 58.dp),
+                ) { Settings.updateCrownZooms(!Settings.crownZooms); poke() }
                 Row(
                     Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -581,6 +782,36 @@ private fun PdfScreen(doc: PdfDoc, positionKey: String) {
             )
         }
     }
+}
+
+private suspend fun renderTile(doc: PageSource, layout: PdfLayout, key: TileKey): Tile? {
+    val d = TILE_PX / key.level
+    val pageTop = layout.tops[key.page]
+    val x = key.tx * d
+    val y = pageTop + key.ty * d
+    val w = min(d, layout.fitW - x)
+    val h = min(d, pageTop + layout.heights[key.page] - y)
+    if (w <= 0f || h <= 0f) return null
+    val k = layout.pointsToDoc[key.page] * key.level
+    val m = Matrix().apply {
+        setScale(k, k)
+        postTranslate(-key.tx * TILE_PX.toFloat(), -key.ty * TILE_PX.toFloat())
+    }
+    val img = doc.render(key.page, ceil(w * key.level).toInt(), ceil(h * key.level).toInt(), m) ?: return null
+    return Tile(key, x, y, w, h, img)
+}
+
+private fun evictFarTiles(tiles: MutableMap<TileKey, Tile>, cx: Float, cy: Float) {
+    val extra = tiles.size - MAX_TILES
+    if (extra <= 0) return
+    tiles.values
+        .sortedByDescending { t ->
+            val dx = t.x + t.w / 2 - cx
+            val dy = t.y + t.h / 2 - cy
+            dx * dx + dy * dy
+        }
+        .take(extra)
+        .forEach { tiles.remove(it.key) }
 }
 
 @Composable

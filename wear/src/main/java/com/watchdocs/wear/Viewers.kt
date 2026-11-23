@@ -138,6 +138,7 @@ fun ViewerScreen(name: String) {
         DocType.PDF -> PdfViewer(file)
         DocType.DOCX -> DocxViewer(file)
         DocType.XLSX -> XlsxViewer(file)
+        DocType.IMAGE -> ImageViewer(file)
         DocType.UNKNOWN -> ErrorMessage("Unsupported file type")
     }
 }

@@ -1,6 +1,10 @@
 package com.watchdocs.mobile
 
 import android.app.Application
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
@@ -19,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -42,7 +47,9 @@ sealed interface WatchState {
 }
 
 private const val CAPABILITY = "watchdocs_viewer"
-private val SUPPORTED = setOf("pdf", "docx", "xlsx")
+private val DOCUMENTS = setOf("pdf", "docx", "xlsx")
+private val IMAGES = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif")
+private const val MAX_IMAGE_DIM = 2048
 
 class TransferViewModel(app: Application) : AndroidViewModel(app) {
     private val channelClient = Wearable.getChannelClient(app)
@@ -121,10 +128,16 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
             if (name == "document") uri.lastPathSegment?.substringAfterLast('/')?.let { name = it }
 
             val id = UUID.randomUUID().toString()
-            val ext = name.substringAfterLast('.', "").lowercase()
-            if (ext !in SUPPORTED) {
+            var ext = name.substringAfterLast('.', "").lowercase()
+            val mime = runCatching { resolver.getType(uri) }.getOrNull().orEmpty()
+            if (ext !in DOCUMENTS && ext !in IMAGES && mime.startsWith("image/")) {
+                // Shared images sometimes come without a file extension.
+                ext = mime.removePrefix("image/").let { if (it == "jpeg") "jpg" else it }
+                name = "$name.$ext"
+            }
+            if (ext !in DOCUMENTS && ext !in IMAGES) {
                 _transfers.update {
-                    listOf(Transfer(id, name, size, Status.FAILED, message = "Only PDF, DOCX and XLSX are supported")) + it
+                    listOf(Transfer(id, name, size, Status.FAILED, message = "Only PDF, Word, Excel and images are supported")) + it
                 }
                 continue
             }
@@ -142,14 +155,27 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
         set(id) { copy(status = Status.SENDING, progress = 0f) }
         val ack = CompletableDeferred<Boolean>()
         acks[id] = ack
+        var temp: File? = null
         try {
             val node = findWatch() ?: error("No watch with WatchDocs installed is reachable")
-            val path = "/doc/$id/${t.size}/${Uri.encode(t.name)}"
+            var src = uri
+            var sendName = t.name
+            var sendSize = t.size
+            if (t.name.substringAfterLast('.', "").lowercase() in IMAGES) {
+                withContext(Dispatchers.IO) { shrinkImage(uri, t.name, t.size) }?.let { (file, name) ->
+                    temp = file
+                    src = Uri.fromFile(file)
+                    sendName = name
+                    sendSize = file.length()
+                    set(id) { copy(name = name, size = sendSize) }
+                }
+            }
+            val path = "/doc/$id/$sendSize/${Uri.encode(sendName)}"
             val channel = channelClient.openChannel(node.id, path).await()
             val out = channelClient.getOutputStream(channel).await()
             withContext(Dispatchers.IO) {
                 val resolver = getApplication<Application>().contentResolver
-                val input = resolver.openInputStream(uri) ?: error("Can't read the file")
+                val input = resolver.openInputStream(src) ?: error("Can't read the file")
                 input.use { inp ->
                     out.use { o ->
                         val buf = ByteArray(64 * 1024)
@@ -160,9 +186,9 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
                             if (n < 0) break
                             o.write(buf, 0, n)
                             sent += n
-                            if (t.size > 0 && sent - lastReport > 128 * 1024) {
+                            if (sendSize > 0 && sent - lastReport > 128 * 1024) {
                                 lastReport = sent
-                                val p = sent.toFloat() / t.size
+                                val p = sent.toFloat() / sendSize
                                 set(id) { copy(progress = p) }
                             }
                         }
@@ -180,7 +206,51 @@ class TransferViewModel(app: Application) : AndroidViewModel(app) {
             set(id) { copy(status = Status.FAILED, message = e.message ?: e.javaClass.simpleName) }
         } finally {
             acks.remove(id)
+            temp?.delete()
         }
+    }
+
+    /**
+     * Big photos are slow to send over Bluetooth and far larger than a watch screen needs:
+     * scale them to at most 2048 px, apply the EXIF rotation, and re-encode.
+     * Returns null when the original is already small enough to send as-is.
+     */
+    private fun shrinkImage(uri: Uri, name: String, size: Long): Pair<File, String>? {
+        val app = getApplication<Application>()
+        val resolver = app.contentResolver
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+        val orientation = runCatching {
+            resolver.openInputStream(uri)?.use {
+                ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            }
+        }.getOrNull() ?: ExifInterface.ORIENTATION_NORMAL
+        val rotation = when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> 0f
+        }
+        if (maxDim <= MAX_IMAGE_DIM && rotation == 0f && size in 0..1_500_000) return null
+
+        var sample = 1
+        while (maxDim / (sample * 2) >= MAX_IMAGE_DIM) sample *= 2
+        val decoded = resolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+        } ?: return null
+        val scale = minOf(1f, MAX_IMAGE_DIM.toFloat() / maxOf(decoded.width, decoded.height))
+        val m = Matrix().apply {
+            postScale(scale, scale)
+            postRotate(rotation)
+        }
+        val out = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, m, true)
+        val keepAlpha = out.hasAlpha() && name.substringAfterLast('.', "").lowercase() in setOf("png", "webp", "gif")
+        val outName = name.substringBeforeLast('.') + if (keepAlpha) ".png" else ".jpg"
+        val file = File(app.cacheDir, "send_${System.nanoTime()}.tmp")
+        file.outputStream().use { out.compress(if (keepAlpha) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG, 88, it) }
+        return file to outName
     }
 
     fun clearFinished() {

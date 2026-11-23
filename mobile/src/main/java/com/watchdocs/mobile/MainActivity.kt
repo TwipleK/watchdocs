@@ -59,6 +59,7 @@ private val MIME_TYPES = arrayOf(
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "image/*",
 )
 
 class MainActivity : ComponentActivity() {
@@ -132,7 +133,8 @@ private fun HomeScreen(vm: TransferViewModel) {
                 Text("Send documents to watch")
             }
             Text(
-                "PDF, Word (.docx) and Excel (.xlsx). You can also use Share → WatchDocs from any app. " +
+                "PDF, Word (.docx), Excel (.xlsx) and images (big photos are shrunk for the watch). " +
+                    "You can also use Share → WatchDocs from any app. " +
                     "Manage and delete documents on the watch (long-press in the list).",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,

@@ -9,6 +9,7 @@ enum class DocType(val label: String, val color: Long) {
     PDF("PDF", 0xFFE53935),
     DOCX("DOC", 0xFF1E88E5),
     XLSX("XLS", 0xFF43A047),
+    IMAGE("IMG", 0xFF8E24AA),
     UNKNOWN("?", 0xFF757575);
 
     companion object {
@@ -16,6 +17,7 @@ enum class DocType(val label: String, val color: Long) {
             "pdf" -> PDF
             "docx" -> DOCX
             "xlsx" -> XLSX
+            "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif" -> IMAGE
             else -> UNKNOWN
         }
     }
