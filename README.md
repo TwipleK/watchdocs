@@ -8,7 +8,7 @@ Send a document from your phone, and it's stored on the watch, so you can read i
 - **Word (.docx):** text, headings, lists and tables, with adjustable text size.
 - **Excel (.xlsx):** a scrollable grid with all sheets.
 - **Images (JPG, PNG, WebP, HEIC…):** pan and zoom. The phone shrinks big photos before sending, so transfers are fast.
-- **Crown:** scrolls by default. Switch it to zoom in the watch app's Settings, or with the "Crown" button in the viewer controls.
+- **Crown:** scrolls by default. Switch it to zoom under Settings at the bottom of the watch's document list.
 
 Works with Wear OS 3+ watches (Pixel Watch, Galaxy Watch 4 and newer, …) paired with an Android phone.
 

@@ -751,10 +751,6 @@ private fun PagedScreen(doc: PageSource, positionKey: String) {
                         state.nextPage(); poke()
                     }
                 }
-                Pill(
-                    if (Settings.crownZooms) "Crown: zoom" else "Crown: scroll",
-                    Modifier.align(Alignment.BottomCenter).padding(bottom = 58.dp),
-                ) { Settings.updateCrownZooms(!Settings.crownZooms); poke() }
                 Row(
                     Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
